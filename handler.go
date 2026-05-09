@@ -28,6 +28,7 @@ type langHandler struct {
 	conn         *jsonrpc2.Conn
 	request      chan DocumentURI
 	command      []string
+	configDir    string
 	noLinterName bool
 
 	rootURI string
@@ -53,6 +54,57 @@ func findModuleRoot(filePath, fallback string) string {
 	return fallback
 }
 
+func configDirFromCommand(command []string) string {
+	for i, arg := range command {
+		if arg == "--config" && i+1 < len(command) {
+			return filepath.Dir(command[i+1])
+		}
+		if after, ok := strings.CutPrefix(arg, "--config="); ok {
+			return filepath.Dir(after)
+		}
+	}
+	return ""
+}
+
+// golangciLintConfigNames lists the config file names golangci-lint searches
+// for, in priority order.
+var golangciLintConfigNames = []string{
+	".golangci.yaml",
+	".golangci.yml",
+	".golangci.json",
+	".golangci.toml",
+}
+
+// findConfigDir determines the directory that golangci-lint would resolve its
+// config file from when invoked with cmdDir as its working directory. It
+// replicates golangci-lint's config search order: walk up from cmdDir, then
+// check $HOME. Issue paths in golangci-lint output are always relative to the
+// config directory, so we must resolve them against this directory.
+func findConfigDir(cmdDir string) string {
+	dir := cmdDir
+	for {
+		for _, name := range golangciLintConfigNames {
+			if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+				return dir
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	home, err := os.UserHomeDir()
+	if err == nil {
+		for _, name := range golangciLintConfigNames {
+			if _, err := os.Stat(filepath.Join(home, name)); err == nil {
+				return home
+			}
+		}
+	}
+	return cmdDir
+}
+
 func (h *langHandler) errToDiagnostics(err error) []Diagnostic {
 	var message string
 	switch e := err.(type) {
@@ -74,7 +126,7 @@ func (h *langHandler) lint(uri DocumentURI) ([]Diagnostic, error) {
 	diagnostics := make([]Diagnostic, 0)
 
 	path := uriToPath(string(uri))
-	dir, file := filepath.Split(path)
+	dir, _ := filepath.Split(path)
 
 	moduleRoot := findModuleRoot(path, h.rootDir)
 
@@ -84,7 +136,6 @@ func (h *langHandler) lint(uri DocumentURI) ([]Diagnostic, error) {
 	cmd := exec.Command(h.command[0], args...)
 	if strings.HasPrefix(path, moduleRoot) {
 		cmd.Dir = moduleRoot
-		file = path[len(moduleRoot)+1:]
 	} else {
 		cmd.Dir = dir
 	}
@@ -108,7 +159,7 @@ func (h *langHandler) lint(uri DocumentURI) ([]Diagnostic, error) {
 	h.logger.DebugJSON("golangci-lint-langserver: result:", result)
 
 	for _, issue := range result.Issues {
-		if file != issue.Pos.Filename {
+		if !h.isSameFile(issue.Pos.Filename, path, cmd.Dir) {
 			continue
 		}
 
@@ -139,6 +190,33 @@ func (h *langHandler) diagnosticMessage(issue *Issue) string {
 	}
 
 	return fmt.Sprintf("%s: %s", issue.FromLinter, issue.Text)
+}
+
+func (h *langHandler) isSameFile(issueFilename, filePath string, cmdDir string) bool {
+	// Determine the directory that golangci-lint resolves paths relative to.
+	// When --config is specified explicitly, use its directory. Otherwise
+	// replicate golangci-lint's auto-discovery to find the config directory.
+	configDir := h.configDir
+	if configDir == "" {
+		configDir = findConfigDir(cmdDir)
+	}
+
+	issueAbs := filepath.Clean(filepath.Join(configDir, issueFilename))
+	if issueAbs == filePath {
+		return true
+	}
+
+	// Also try cmdDir as a fallback for edge cases (e.g., older
+	// golangci-lint versions that may report paths relative to the
+	// working directory regardless of config location).
+	if configDir != cmdDir {
+		issueAbs = filepath.Clean(filepath.Join(cmdDir, issueFilename))
+		if issueAbs == filePath {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (h *langHandler) linter() {
@@ -202,6 +280,7 @@ func (h *langHandler) handleInitialize(_ context.Context, conn *jsonrpc2.Conn, r
 	h.rootDir = uriToPath(params.RootURI)
 	h.conn = conn
 	h.command = params.InitializationOptions.Command
+	h.configDir = configDirFromCommand(h.command)
 
 	return InitializeResult{
 		Capabilities: ServerCapabilities{
